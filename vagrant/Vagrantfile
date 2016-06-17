@@ -1,0 +1,74 @@
+# -*- mode: ruby -*-
+# # vi: set ft=ruby :
+
+require 'fileutils'
+require 'open-uri'
+require 'tempfile'
+require 'yaml'
+
+Vagrant.require_version ">= 1.6.0"
+
+CLUSTER_IP="10.3.0.1"
+NODE_IP = "172.17.4.99"
+USER_DATA_PATH = File.expand_path("user-data")
+SSL_TARBALL_PATH = File.expand_path("ssl/controller.tar")
+
+TOKEN_AUTH_FILE = File.expand_path("token-auth-file")
+
+$update_channel = "stable"
+$image_version = "current"
+
+Vagrant.configure("2") do |config|
+  # always use Vagrant's insecure key
+  config.ssh.insert_key = false
+
+  config.vm.box = "coreos-%s" % $update_channel
+  if $image_version != "current"
+      config.vm.box_version = $image_version
+  end
+  config.vm.box_url = "http://%s.release.core-os.net/amd64-usr/%s/coreos_production_vagrant.json" % [$update_channel, $image_version]
+
+  ["vmware_fusion", "vmware_workstation"].each do |vmware|
+    config.vm.provider vmware do |v, override|
+      v.vmx['numvcpus'] = 1
+      v.vmx['memsize'] = 1024
+      v.gui = false
+
+      override.vm.box_url = "http://alpha.release.core-os.net/amd64-usr/current/coreos_production_vagrant_vmware_fusion.json"
+    end
+  end
+
+  config.vm.provider :virtualbox do |v|
+    v.cpus = 1
+    v.gui = false
+    v.memory = 1024
+
+    # On VirtualBox, we don't have guest additions or a functional vboxsf
+    # in CoreOS, so tell Vagrant that so it can be smarter.
+    v.check_guest_additions = false
+    v.functional_vboxsf     = false
+  end
+
+  # plugin conflict
+  if Vagrant.has_plugin?("vagrant-vbguest") then
+    config.vbguest.auto_update = false
+  end
+
+  config.vm.network "forwarded_port", guest: 30080, host: 30080, protocol: "tcp"
+  config.vm.network :private_network, ip: NODE_IP
+
+  config.vm.synced_folder "/<path to your vagrant folder>/vagrant/pangaea-cache/", "/opt/pangaea/cache",
+                          :nfs => true, :mount_options => ['nolock,vers=3,udp']
+  #uncomment the below line and add path to include synced folder
+  #config.vm.synced_folder "/path/to/your/folder", "/<mount_at>folder"
+  
+  config.vm.provision :file, :source => SSL_TARBALL_PATH, :destination => "/tmp/ssl.tar"
+  config.vm.provision :shell, :inline => "mkdir -p /etc/kubernetes/ssl && tar -C /etc/kubernetes/ssl -xf /tmp/ssl.tar", :privileged => true
+
+  config.vm.provision :file, :source => TOKEN_AUTH_FILE, :destination => "/tmp/token-auth-file"
+  config.vm.provision :shell, :inline => "mv /tmp/token-auth-file /etc/kubernetes/token-auth-file", :privileged => true
+
+  config.vm.provision :file, :source => USER_DATA_PATH, :destination => "/tmp/vagrantfile-user-data"
+  config.vm.provision :shell, :inline => "mv /tmp/vagrantfile-user-data /var/lib/coreos-vagrant/", :privileged => true
+
+end
