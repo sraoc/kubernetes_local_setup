@@ -1,0 +1,833 @@
+#!/bin/bash
+set -e
+
+# List of etcd servers (http://ip:port), comma separated
+export ETCD_ENDPOINTS="http://127.0.0.1:2379"
+
+# Specify the version (vX.Y.Z) of Kubernetes assets to deploy
+# export K8S_VER=v1.2.3
+export K8S_VER=v1.2.4_coreos.1
+export KUBELET_VER=v1.2.4_coreos.1
+# export HYPERKUBE_IMAGE=registry-1.docker.io/hasura/hyperkube:$K8S_VER
+export REGISTRY_VER=2.4.0
+export PAN_CACHE=/opt/pangaea/cache
+
+export KUBELET_WRAPPER_VER=435f8dc
+
+export RKT_BIN=/usr/bin/rkt
+
+# Specify the version of registry
+
+# The CIDR network to use for pod IPs.
+# Each pod launched in the cluster will be assigned an IP out of this range.
+# Each node will be configured such that these IPs will be routable using the flannel overlay network.
+export POD_NETWORK=10.2.0.0/16
+
+# The CIDR network to use for service cluster IPs.
+# Each service will be assigned a cluster IP out of this range.
+# This must not overlap with any IP ranges assigned to the POD_NETWORK, or other existing network infrastructure.
+# Routing to these IPs is handled by a proxy service local to each node, and are not required to be routable between nodes.
+export SERVICE_IP_RANGE=10.3.0.0/24
+
+# The IP address of the Kubernetes API Service
+# If the SERVICE_IP_RANGE is changed above, this must be set to the first IP in that range.
+export K8S_SERVICE_IP=10.3.0.1
+
+# The IP address of the cluster DNS service.
+# This IP must be in the range of the SERVICE_IP_RANGE and cannot be the first IP in the range.
+# This same IP must be configured on all worker nodes to enable DNS service discovery.
+export DNS_SERVICE_IP=10.3.0.10
+
+# -------------
+
+function install_kubelet_wrapper {
+    mkdir -p /opt/bin
+    curl "https://raw.githubusercontent.com/coreos/coreos-overlay/$KUBELET_WRAPPER_VER/app-admin/kubelet-wrapper/files/kubelet-wrapper" > /opt/bin/kubelet-wrapper
+    chmod +x /opt/bin/kubelet-wrapper
+}
+
+function fetch_hyperkube {
+
+    local HYPERKUBE_CACHE=$PAN_CACHE/kubernetes
+
+    # Initialise the registry cache directory
+    mkdir -p $HYPERKUBE_CACHE
+
+    local HYPERKUBE_ACI=$HYPERKUBE_CACHE/hyperkube-$KUBELET_VER.aci
+    local HYPERKUBE_IMAGE=quay.io/coreos/hyperkube:$KUBELET_VER
+
+    # If rkt already has the image
+    if [[ "$($RKT_BIN image list | grep $HYPERKUBE_IMAGE 2> /dev/null)" != "" ]]; then
+        echo "$HYPERKUBE_IMAGE image already exists"
+
+    # If the export of the registry is present
+    elif [[ -f $HYPERKUBE_ACI ]]; then
+        echo "Loading hyperkube:$HYPERKUBE_VER image from $HYPERKUBE_ACI"
+        $RKT_BIN fetch --insecure-options=image file:///$HYPERKUBE_ACI
+
+    # The image is neither with rkt nor is cached
+    else
+        echo "Pulling image $HYPERKUBE_IMAGE from dockerhub"
+        $RKT_BIN --trust-keys-from-https fetch $HYPERKUBE_IMAGE
+        # $RKT_BIN --insecure-options=image fetch docker://$HYPERKUBE_IMAGE
+        echo "Saving $HYPERKUBE_IMAGE to $HYPERKUBE_ACI"
+        $RKT_BIN image export $HYPERKUBE_IMAGE $HYPERKUBE_ACI
+    fi
+}
+
+function init_config {
+    local REQUIRED=('ADVERTISE_IP' 'POD_NETWORK' 'ETCD_ENDPOINTS' 'SERVICE_IP_RANGE' 'K8S_SERVICE_IP' 'DNS_SERVICE_IP' 'K8S_VER' 'REGISTRY_VER' 'RKT_BIN')
+
+    if [ -z $ADVERTISE_IP ]; then
+        export ADVERTISE_IP=$(awk -F= '/COREOS_PUBLIC_IPV4/ {print $2}' /etc/environment)
+    fi
+
+    for REQ in "${REQUIRED[@]}"; do
+        if [ -z "$(eval echo \$$REQ)" ]; then
+            echo "Missing required config value: ${REQ}"
+            exit 1
+        fi
+    done
+}
+
+function init_flannel {
+    echo "Waiting for etcd..."
+    while true
+    do
+        IFS=',' read -ra ES <<< "$ETCD_ENDPOINTS"
+        for ETCD in "${ES[@]}"; do
+            echo "Trying: $ETCD"
+            if [ -n "$(curl --silent "$ETCD/v2/machines")" ]; then
+                local ACTIVE_ETCD=$ETCD
+                break
+            fi
+            sleep 1
+        done
+        if [ -n "$ACTIVE_ETCD" ]; then
+            break
+        fi
+    done
+    RES=$(curl --silent -X PUT -d "value={\"Network\":\"$POD_NETWORK\",\"Backend\":{\"Type\":\"vxlan\"}}" "$ACTIVE_ETCD/v2/keys/coreos.com/network/config?prevExist=false")
+    if [ -z "$(echo $RES | grep '"action":"create"')" ] && [ -z "$(echo $RES | grep 'Key already exists')" ]; then
+        echo "Unexpected error configuring flannel pod network: $RES"
+    fi
+}
+
+function init_registry_cache {
+
+    local REGISTRY_CACHE=$PAN_CACHE/registry
+
+    # Initialise the registry cache directory
+    mkdir -p $REGISTRY_CACHE/{images,data}
+    local TEMPLATE=$REGISTRY_CACHE/config.yml
+    [ -f $TEMPLATE ] || {
+        echo "TEMPLATE: $TEMPLATE"
+        mkdir -p $(dirname $TEMPLATE)
+        cat << EOF > $TEMPLATE
+version: 0.1
+log:
+  fields:
+    service: registry
+
+storage:
+    cache:
+        blobdescriptor: inmemory
+    filesystem:
+        rootdirectory: /var/lib/registry/data
+
+http:
+    addr: :5000
+    headers:
+        X-Content-Type-Options: [nosniff]
+
+proxy:
+  remoteurl: https://registry-1.docker.io
+
+health:
+  storagedriver:
+    enabled: true
+    interval: 10s
+    threshold: 3
+EOF
+    }
+
+    local REGISTRY_ACI=$REGISTRY_CACHE/images/registry-$REGISTRY_VER.aci
+    local REGISTRY_IMAGE=registry-1.docker.io/library/registry:$REGISTRY_VER
+
+    # If rkt already has the image
+    if [[ "$($RKT_BIN image list | grep $REGISTRY_IMAGE 2> /dev/null)" != "" ]]; then
+        echo "$REGISTRY_IMAGE image already exists"
+
+    # If the export of the registry is present
+    elif [[ -f $REGISTRY_ACI ]]; then
+        echo "Loading registry:$REGISTRY_VER image from $REGISTRY_ACI"
+        $RKT_BIN --insecure-options=image fetch file:///$REGISTRY_ACI
+
+    # The image is neither with rkt nor is cached
+    else
+        echo "Pulling image $REGISTRY_IMAGE from dockerhub"
+        $RKT_BIN --insecure-options=image fetch docker://$REGISTRY_IMAGE
+        echo "Saving $REGISTRY_IMAGE to $REGISTRY_ACI"
+        $RKT_BIN image export $REGISTRY_IMAGE $REGISTRY_ACI
+    fi
+
+    local TEMPLATE=/etc/systemd/system/registry-cache.service
+    [ -f $TEMPLATE ] || {
+        echo "TEMPLATE: $TEMPLATE"
+        mkdir -p $(dirname $TEMPLATE)
+        cat << EOF > $TEMPLATE
+[Unit]
+Description=Pull through registry cache
+[Service]
+ExecStart=$RKT_BIN run --port=5000-tcp:5000 \
+   --volume=registry-config,kind=host,source=$REGISTRY_CACHE/config.yml,readOnly=false \
+   --mount volume=registry-config,target=/etc/docker/registry/config.yml \
+   --volume=registry-data,kind=host,source=$REGISTRY_CACHE/data,readOnly=false \
+   --mount volume=registry-data,target=/var/lib/registry/data \
+   $REGISTRY_IMAGE
+KillMode=mixed
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    }
+}
+
+function init_templates {
+
+    KUBELET_DEPENDENCY=registry-cache.service
+    local TEMPLATE=/etc/systemd/system/kubelet.service
+    [ -f $TEMPLATE ] || {
+        echo "TEMPLATE: $TEMPLATE"
+        mkdir -p $(dirname $TEMPLATE)
+        cat << EOF > $TEMPLATE
+[Unit]
+Description=Kubelet service
+After=$KUBELET_DEPENDENCY
+Requires=$KUBELET_DEPENDENCY
+[Service]
+ExecStartPre=/usr/bin/mkdir -p /etc/kubernetes/manifests
+
+Environment=KUBELET_VERSION=${KUBELET_VER}
+ExecStart=/opt/bin/kubelet-wrapper \
+  --api-servers=http://127.0.0.1:8080 \
+  --register-node=true \
+  --allow-privileged=true \
+  --config=/etc/kubernetes/manifests \
+  --hostname-override=${ADVERTISE_IP} \
+  --cluster_dns=${DNS_SERVICE_IP} \
+  --cluster_domain=cluster.local
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    }
+
+    local TEMPLATE=/etc/kubernetes/manifests/kube-proxy.yaml
+    [ -f $TEMPLATE ] || {
+        echo "TEMPLATE: $TEMPLATE"
+        mkdir -p $(dirname $TEMPLATE)
+        cat << EOF > $TEMPLATE
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kube-proxy
+  namespace: kube-system
+spec:
+  hostNetwork: true
+  containers:
+  - name: kube-proxy
+    image: hasura/hyperkube:$K8S_VER
+    command:
+    - /hyperkube
+    - proxy
+    - --master=http://127.0.0.1:8080
+    - --proxy-mode=iptables
+    securityContext:
+      privileged: true
+    volumeMounts:
+    - mountPath: /etc/ssl/certs
+      name: ssl-certs-host
+      readOnly: true
+  volumes:
+  - hostPath:
+      path: /usr/share/ca-certificates
+    name: ssl-certs-host
+EOF
+    }
+
+    local TEMPLATE=/etc/kubernetes/manifests/kube-apiserver.yaml
+    [ -f $TEMPLATE ] || {
+        echo "TEMPLATE: $TEMPLATE"
+        mkdir -p $(dirname $TEMPLATE)
+        cat << EOF > $TEMPLATE
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kube-apiserver
+  namespace: kube-system
+spec:
+  hostNetwork: true
+  containers:
+  - name: kube-apiserver
+    image: hasura/hyperkube:$K8S_VER
+    command:
+    - /hyperkube
+    - apiserver
+    - --bind-address=0.0.0.0
+    - --etcd-servers=${ETCD_ENDPOINTS}
+    - --allow-privileged=true
+    - --service-cluster-ip-range=${SERVICE_IP_RANGE}
+    - --secure-port=443
+    - --advertise-address=${ADVERTISE_IP}
+    - --admission-control=NamespaceLifecycle,LimitRanger,SecurityContextDeny,ServiceAccount,ResourceQuota
+    - --tls-cert-file=/etc/kubernetes/ssl/apiserver.pem
+    - --tls-private-key-file=/etc/kubernetes/ssl/apiserver-key.pem
+    - --client-ca-file=/etc/kubernetes/ssl/ca.pem
+    - --service-account-key-file=/etc/kubernetes/ssl/apiserver-key.pem
+    - --token-auth-file=/etc/kubernetes/token-auth-file
+    - --runtime-config=extensions/v1beta1/deployments=true,extensions/v1beta1/daemonsets=true,extensions/v1beta1/thirdpartyresources=true
+    ports:
+    - containerPort: 443
+      hostPort: 443
+      name: https
+    - containerPort: 8080
+      hostPort: 8080
+      name: local
+    volumeMounts:
+    - mountPath: /etc/kubernetes/ssl
+      name: ssl-certs-kubernetes
+      readOnly: true
+    - mountPath: /etc/kubernetes/token-auth-file
+      name: token-auth-file
+      readOnly: true
+    - mountPath: /etc/ssl/certs
+      name: ssl-certs-host
+      readOnly: true
+  volumes:
+  - hostPath:
+      path: /etc/kubernetes/ssl
+    name: ssl-certs-kubernetes
+  - hostPath:
+      path: /usr/share/ca-certificates
+    name: ssl-certs-host
+  - hostPath:
+      path: /etc/kubernetes/token-auth-file
+    name: token-auth-file
+EOF
+    }
+
+    local TEMPLATE=/etc/kubernetes/manifests/kube-controller-manager.yaml
+    [ -f $TEMPLATE ] || {
+        echo "TEMPLATE: $TEMPLATE"
+        mkdir -p $(dirname $TEMPLATE)
+        cat << EOF > $TEMPLATE
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kube-controller-manager
+  namespace: kube-system
+spec:
+  containers:
+  - name: kube-controller-manager
+    image: hasura/hyperkube:$K8S_VER
+    command:
+    - /hyperkube
+    - controller-manager
+    - --master=http://127.0.0.1:8080
+    - --service-account-private-key-file=/etc/kubernetes/ssl/apiserver-key.pem
+    - --root-ca-file=/etc/kubernetes/ssl/ca.pem
+    livenessProbe:
+      httpGet:
+        host: 127.0.0.1
+        path: /healthz
+        port: 10252
+      initialDelaySeconds: 15
+      timeoutSeconds: 1
+    volumeMounts:
+    - mountPath: /etc/kubernetes/ssl
+      name: ssl-certs-kubernetes
+      readOnly: true
+    - mountPath: /etc/ssl/certs
+      name: ssl-certs-host
+      readOnly: true
+  hostNetwork: true
+  volumes:
+  - hostPath:
+      path: /etc/kubernetes/ssl
+    name: ssl-certs-kubernetes
+  - hostPath:
+      path: /usr/share/ca-certificates
+    name: ssl-certs-host
+EOF
+    }
+
+    local TEMPLATE=/etc/kubernetes/manifests/kube-scheduler.yaml
+    [ -f $TEMPLATE ] || {
+        echo "TEMPLATE: $TEMPLATE"
+        mkdir -p $(dirname $TEMPLATE)
+        cat << EOF > $TEMPLATE
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kube-scheduler
+  namespace: kube-system
+spec:
+  hostNetwork: true
+  containers:
+  - name: kube-scheduler
+    image: hasura/hyperkube:$K8S_VER
+    command:
+    - /hyperkube
+    - scheduler
+    - --master=http://127.0.0.1:8080
+    livenessProbe:
+      httpGet:
+        host: 127.0.0.1
+        path: /healthz
+        port: 10251
+      initialDelaySeconds: 15
+      timeoutSeconds: 1
+EOF
+    }
+
+    local TEMPLATE=/srv/kubernetes/manifests/kube-system.json
+    [ -f $TEMPLATE ] || {
+        echo "TEMPLATE: $TEMPLATE"
+        mkdir -p $(dirname $TEMPLATE)
+        cat << EOF > $TEMPLATE
+{
+  "apiVersion": "v1",
+  "kind": "Namespace",
+  "metadata": {
+    "name": "kube-system"
+  }
+}
+EOF
+    }
+
+    local TEMPLATE=/srv/kubernetes/manifests/kube-dns-rc.json
+    [ -f $TEMPLATE ] || {
+        echo "TEMPLATE: $TEMPLATE"
+        mkdir -p $(dirname $TEMPLATE)
+        cat << EOF > $TEMPLATE
+{
+  "apiVersion": "v1",
+  "kind": "ReplicationController",
+  "metadata": {
+    "labels": {
+      "k8s-app": "kube-dns",
+      "kubernetes.io/cluster-service": "true",
+      "version": "v11"
+    },
+    "name": "kube-dns-v11",
+    "namespace": "kube-system"
+  },
+  "spec": {
+    "replicas": 1,
+    "selector": {
+      "k8s-app": "kube-dns",
+      "version": "v11"
+    },
+    "template": {
+      "metadata": {
+        "labels": {
+          "k8s-app": "kube-dns",
+          "kubernetes.io/cluster-service": "true",
+          "version": "v11"
+        }
+      },
+      "spec": {
+        "containers": [
+          {
+            "command": [
+              "/usr/local/bin/etcd",
+              "-data-dir",
+              "/var/etcd/data",
+              "-listen-client-urls",
+              "http://127.0.0.1:2379,http://127.0.0.1:4001",
+              "-advertise-client-urls",
+              "http://127.0.0.1:2379,http://127.0.0.1:4001",
+              "-initial-cluster-token",
+              "skydns-etcd"
+            ],
+            "image": "hasura/etcd-amd64:2.2.1",
+            "name": "etcd",
+            "resources": {
+              "limits": {
+                "cpu": "100m",
+                "memory": "500Mi"
+              },
+              "requests": {
+                "cpu": "100m",
+                "memory": "50Mi"
+              }
+            },
+            "volumeMounts": [
+              {
+                "mountPath": "/var/etcd/data",
+                "name": "etcd-storage"
+              }
+            ]
+          },
+          {
+            "args": [
+              "--domain=cluster.local"
+            ],
+            "image": "hasura/kube2sky:1.14",
+            "livenessProbe": {
+              "failureThreshold": 5,
+              "httpGet": {
+                "path": "/healthz",
+                "port": 8080,
+                "scheme": "HTTP"
+              },
+              "initialDelaySeconds": 60,
+              "successThreshold": 1,
+              "timeoutSeconds": 5
+            },
+            "name": "kube2sky",
+            "readinessProbe": {
+              "httpGet": {
+                "path": "/readiness",
+                "port": 8081,
+                "scheme": "HTTP"
+              },
+              "initialDelaySeconds": 30,
+              "timeoutSeconds": 5
+            },
+            "resources": {
+              "limits": {
+                "cpu": "100m",
+                "memory": "200Mi"
+              },
+              "requests": {
+                "cpu": "100m",
+                "memory": "50Mi"
+              }
+            }
+          },
+          {
+            "args": [
+              "-machines=http://127.0.0.1:4001",
+              "-addr=0.0.0.0:53",
+              "-ns-rotate=false",
+              "-domain=cluster.local."
+            ],
+            "image": "hasura/skydns:2015-10-13-8c72f8c",
+            "name": "skydns",
+            "ports": [
+              {
+                "containerPort": 53,
+                "name": "dns",
+                "protocol": "UDP"
+              },
+              {
+                "containerPort": 53,
+                "name": "dns-tcp",
+                "protocol": "TCP"
+              }
+            ],
+            "resources": {
+              "limits": {
+                "cpu": "100m",
+                "memory": "200Mi"
+              },
+              "requests": {
+                "cpu": "100m",
+                "memory": "50Mi"
+              }
+            }
+          },
+          {
+            "args": [
+              "-cmd=nslookup kubernetes.default.svc.cluster.local 127.0.0.1 >/dev/null",
+              "-port=8080"
+            ],
+            "image": "hasura/exechealthz:1.0",
+            "name": "healthz",
+            "ports": [
+              {
+                "containerPort": 8080,
+                "protocol": "TCP"
+              }
+            ],
+            "resources": {
+              "limits": {
+                "cpu": "10m",
+                "memory": "20Mi"
+              },
+              "requests": {
+                "cpu": "10m",
+                "memory": "20Mi"
+              }
+            }
+          }
+        ],
+        "dnsPolicy": "Default",
+        "volumes": [
+          {
+            "emptyDir": {},
+            "name": "etcd-storage"
+          }
+        ]
+      }
+    }
+  }
+}
+EOF
+    }
+
+    local TEMPLATE=/srv/kubernetes/manifests/kube-dns-svc.json
+    [ -f $TEMPLATE ] || {
+        echo "TEMPLATE: $TEMPLATE"
+        mkdir -p $(dirname $TEMPLATE)
+        cat << EOF > $TEMPLATE
+{
+  "apiVersion": "v1",
+  "kind": "Service",
+  "metadata": {
+    "name": "kube-dns",
+    "namespace": "kube-system",
+    "labels": {
+      "k8s-app": "kube-dns",
+      "kubernetes.io/name": "KubeDNS",
+      "kubernetes.io/cluster-service": "true"
+    }
+  },
+  "spec": {
+    "clusterIP": "$DNS_SERVICE_IP",
+    "ports": [
+      {
+        "protocol": "UDP",
+        "name": "dns",
+        "port": 53
+      },
+      {
+        "protocol": "TCP",
+        "name": "dns-tcp",
+        "port": 53
+      }
+    ],
+    "selector": {
+      "k8s-app": "kube-dns"
+    }
+  }
+}
+EOF
+    }
+
+    local TEMPLATE=/srv/kubernetes/manifests/heapster-dc.json
+    [ -f $TEMPLATE ] || {
+        echo "TEMPLATE: $TEMPLATE"
+        mkdir -p $(dirname $TEMPLATE)
+        cat << EOF > $TEMPLATE
+{
+  "apiVersion": "extensions/v1beta1",
+  "kind": "Deployment",
+  "metadata": {
+    "labels": {
+      "k8s-app": "heapster",
+      "kubernetes.io/cluster-service": "true",
+      "version": "v1.0.2"
+    },
+    "name": "heapster-v1.0.2",
+    "namespace": "kube-system"
+  },
+  "spec": {
+    "replicas": 1,
+    "selector": {
+      "matchLabels": {
+        "k8s-app": "heapster",
+        "version": "v1.0.2"
+      }
+    },
+    "template": {
+      "metadata": {
+        "labels": {
+          "k8s-app": "heapster",
+          "version": "v1.0.2"
+        }
+      },
+      "spec": {
+        "containers": [
+          {
+            "command": [
+              "/heapster",
+              "--source=kubernetes.summary_api:''",
+              "--metric_resolution=60s"
+            ],
+            "image": "hasura/heapster:v1.0.2",
+            "name": "heapster",
+            "resources": {
+              "limits": {
+                "cpu": "100m",
+                "memory": "250Mi"
+              },
+              "requests": {
+                "cpu": "100m",
+                "memory": "250Mi"
+              }
+            }
+          },
+          {
+            "command": [
+              "/pod_nanny",
+              "--cpu=100m",
+              "--extra-cpu=0m",
+              "--memory=250Mi",
+              "--extra-memory=4Mi",
+              "--threshold=5",
+              "--deployment=heapster-v1.0.2",
+              "--container=heapster",
+              "--poll-period=300000"
+            ],
+            "env": [
+              {
+                "name": "MY_POD_NAME",
+                "valueFrom": {
+                  "fieldRef": {
+                    "fieldPath": "metadata.name"
+                  }
+                }
+              },
+              {
+                "name": "MY_POD_NAMESPACE",
+                "valueFrom": {
+                  "fieldRef": {
+                    "fieldPath": "metadata.namespace"
+                  }
+                }
+              }
+            ],
+            "image": "hasura/addon-resizer:1.0",
+            "name": "heapster-nanny",
+            "resources": {
+              "limits": {
+                "cpu": "50m",
+                "memory": "100Mi"
+              },
+              "requests": {
+                "cpu": "50m",
+                "memory": "100Mi"
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
+}
+EOF
+    }
+
+    local TEMPLATE=/srv/kubernetes/manifests/heapster-svc.json
+    [ -f $TEMPLATE ] || {
+        echo "TEMPLATE: $TEMPLATE"
+        mkdir -p $(dirname $TEMPLATE)
+        cat << EOF > $TEMPLATE
+{
+  "kind": "Service",
+  "apiVersion": "v1",
+  "metadata": {
+    "name": "heapster",
+    "namespace": "kube-system",
+    "labels": {
+      "kubernetes.io/cluster-service": "true",
+      "kubernetes.io/name": "Heapster"
+    }
+  },
+  "spec": {
+    "ports": [
+      {
+        "port": 80,
+        "targetPort": 8082
+      }
+    ],
+    "selector": {
+      "k8s-app": "heapster"
+    }
+  }
+}
+EOF
+    }
+
+    local TEMPLATE=/etc/flannel/options.env
+    [ -f $TEMPLATE ] || {
+        echo "TEMPLATE: $TEMPLATE"
+        mkdir -p $(dirname $TEMPLATE)
+        cat << EOF > $TEMPLATE
+FLANNELD_IFACE=$ADVERTISE_IP
+FLANNELD_ETCD_ENDPOINTS=$ETCD_ENDPOINTS
+EOF
+    }
+
+    local TEMPLATE=/etc/systemd/system/flanneld.service.d/40-ExecStartPre-symlink.conf.conf
+    [ -f $TEMPLATE ] || {
+        echo "TEMPLATE: $TEMPLATE"
+        mkdir -p $(dirname $TEMPLATE)
+        cat << EOF > $TEMPLATE
+[Service]
+ExecStartPre=/usr/bin/ln -sf /etc/flannel/options.env /run/flannel/options.env
+EOF
+    }
+
+    local TEMPLATE=/etc/systemd/system/docker.service.d/40-flannel.conf
+    [ -f $TEMPLATE ] || {
+        echo "TEMPLATE: $TEMPLATE"
+        mkdir -p $(dirname $TEMPLATE)
+        cat << EOF > $TEMPLATE
+[Unit]
+Requires=flanneld.service
+After=flanneld.service
+EOF
+    }
+
+    local TEMPLATE=/etc/systemd/system/docker.service.d/50-opts.conf
+    [ -f $TEMPLATE ] || {
+        echo "TEMPLATE: $TEMPLATE"
+        mkdir -p $(dirname $TEMPLATE)
+        cat << EOF > $TEMPLATE
+
+[Service]
+Environment='DOCKER_OPTS=--registry-mirror http://${ADVERTISE_IP}:5000 --insecure-registry ${ADVERTISE_IP}:5000'
+EOF
+    }
+}
+
+function start_addons {
+    echo "Waiting for Kubernetes API..."
+    until curl --silent "http://127.0.0.1:8080/version"
+    do
+        sleep 5
+    done
+    echo
+    echo "K8S: kube-system namespace"
+    curl --silent -H "Content-Type: application/json" -XPOST -d"$(cat /srv/kubernetes/manifests/kube-system.json)" "http://127.0.0.1:8080/api/v1/namespaces" > /dev/null
+    echo "K8S: DNS addon"
+    curl --silent -H "Content-Type: application/json" -XPOST -d"$(cat /srv/kubernetes/manifests/kube-dns-rc.json)" "http://127.0.0.1:8080/api/v1/namespaces/kube-system/replicationcontrollers" > /dev/null
+    curl --silent -H "Content-Type: application/json" -XPOST -d"$(cat /srv/kubernetes/manifests/kube-dns-svc.json)" "http://127.0.0.1:8080/api/v1/namespaces/kube-system/services" > /dev/null
+    echo "K8S: Heapster addon"
+    curl --silent -H "Content-Type: application/json" -XPOST -d"$(cat /srv/kubernetes/manifests/heapster-dc.json)" "http://127.0.0.1:8080/apis/extensions/v1beta1/namespaces/kube-system/deployments" > /dev/null
+    curl --silent -H "Content-Type: application/json" -XPOST -d"$(cat /srv/kubernetes/manifests/heapster-svc.json)" "http://127.0.0.1:8080/api/v1/namespaces/kube-system/services" > /dev/null
+}
+
+init_config
+fetch_hyperkube
+install_kubelet_wrapper
+init_registry_cache
+init_templates
+systemctl enable etcd2; systemctl start etcd2
+
+init_flannel
+
+systemctl stop update-engine; systemctl mask update-engine
+
+systemctl daemon-reload
+systemctl enable kubelet; systemctl start kubelet
+start_addons
+echo "DONE"
