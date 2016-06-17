@@ -23,6 +23,3 @@ Step 1:
 
   Note #
 		vagrant up # must be run from the same folder/sub-directory  where the vagrant     file is present
-
-
-  
