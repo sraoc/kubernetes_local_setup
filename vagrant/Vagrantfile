@@ -18,6 +18,10 @@ TOKEN_AUTH_FILE = File.expand_path("token-auth-file")
 $update_channel = "stable"
 $image_version = "current"
 
+system("mkdir -p ssl && ./../lib/init-ssl-ca ssl") or abort ("failed generating SSL CA artifacts")
+system("./../lib/init-ssl ssl apiserver controller IP.1=#{NODE_IP},IP.2=#{CLUSTER_IP}") or abort ("failed generating SSL certificate artifacts")
+system("./../lib/init-ssl ssl admin kube-admin") or abort("failed generating admin SSL artifacts")
+
 Vagrant.configure("2") do |config|
   # always use Vagrant's insecure key
   config.ssh.insert_key = false
@@ -57,7 +61,7 @@ Vagrant.configure("2") do |config|
   config.vm.network "forwarded_port", guest: 30080, host: 30080, protocol: "tcp"
   config.vm.network :private_network, ip: NODE_IP
 
-  config.vm.synced_folder "/<path to your vagrant folder>/vagrant/pangaea-cache/", "/opt/pangaea/cache",
+  config.vm.synced_folder "/home/seshu/temp_dir/kubernetes_local_setup/vagrant/pangaea-cache/", "/opt/pangaea/cache",
                           :nfs => true, :mount_options => ['nolock,vers=3,udp']
   #uncomment the below line and add path to include synced folder
   #config.vm.synced_folder "/path/to/your/folder", "/<mount_at>folder"
