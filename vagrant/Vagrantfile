@@ -61,7 +61,7 @@ Vagrant.configure("2") do |config|
   config.vm.network "forwarded_port", guest: 30080, host: 30080, protocol: "tcp"
   config.vm.network :private_network, ip: NODE_IP
 
-  config.vm.synced_folder "/home/seshu/temp_dir/kubernetes_local_setup/vagrant/pangaea-cache/", "/opt/pangaea/cache",
+  config.vm.synced_folder "/<path to your kubernetes_local_setup folder>/kubernetes_local_setup/vagrant/pangaea-cache/", "/opt/pangaea/cache",
                           :nfs => true, :mount_options => ['nolock,vers=3,udp']
   #uncomment the below line and add path to include synced folder
   #config.vm.synced_folder "/path/to/your/folder", "/<mount_at>folder"
